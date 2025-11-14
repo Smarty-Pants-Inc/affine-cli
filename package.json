@@ -1,0 +1,63 @@
+{
+  "name": "@smarty/affine-cli",
+  "version": "0.1.1",
+  "private": false,
+  "bin": {
+    "affine": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Smarty-Pants-Inc/smarty-dev.git",
+    "directory": "packages/affine-cli"
+  },
+  "bugs": {
+    "url": "https://github.com/Smarty-Pants-Inc/smarty-dev/issues"
+  },
+  "homepage": "https://github.com/Smarty-Pants-Inc/smarty-dev#readme",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "e2e:local": "AFFINE_E2E=1 vitest run -c vitest.e2e.config.ts",
+    "smoke:rubric": "tsx ../../scripts/affine-cli/rubric-smoke.ts",
+    "codegen": "graphql-codegen --config codegen.cjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@blocksuite/blocks": "^0.19.5",
+    "@blocksuite/store": "^0.22.4",
+    "commander": "^12.0.0",
+    "esbuild": "^0.27.0",
+    "socket.io-client": "^4.8.1",
+    "undici": "^6.0.0",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@graphql-codegen/cli": "^5.0.0",
+    "@graphql-codegen/typescript": "^4.0.0",
+    "@graphql-codegen/typescript-operations": "^4.0.0",
+    "@types/node": "^20.19.24",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "eslint": "^9.0.0",
+    "graphql": "^16.9.0",
+    "prettier": "^3.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
+  }
+}
