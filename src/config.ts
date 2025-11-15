@@ -145,8 +145,15 @@ async function writeJsonAtomic(filePath: string, data: any): Promise<void> {
     `.config.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`,
   );
   const json = JSON.stringify(data, null, 2);
-  await fs.writeFile(tmp, json, 'utf8');
+  // Write temp file with restrictive permissions; then atomically rename.
+  await fs.writeFile(tmp, json, { encoding: 'utf8', mode: 0o600 });
   await fs.rename(tmp, filePath);
+  try {
+    // Best-effort: ensure final config file is owner-readable/writable only.
+    await fs.chmod(filePath, 0o600);
+  } catch {
+    // Ignore chmod failures (e.g., on non-POSIX filesystems).
+  }
 }
 
 export type WriteConfigProfileOptions = {

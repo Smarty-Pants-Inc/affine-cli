@@ -105,6 +105,7 @@ async function rpc<T = any>(workspaceId: string, method: string, params?: Record
     token: (opts as any)?.token,
     cookie: (opts as any)?.cookie,
     timeoutMs: (opts as any)?.timeoutMs,
+    maxAttempts: (opts as any)?.maxAttempts,
     debug: (opts as any)?.debug,
     responseType: 'text',
   });

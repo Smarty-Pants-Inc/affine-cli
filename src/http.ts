@@ -129,6 +129,25 @@ function redactHeaders(headers: Record<string, string>): Record<string, string> 
   return redacted;
 }
 
+function redactJsonPreview(key: string, value: unknown): unknown {
+  const k = String(key).toLowerCase();
+  if (
+    k &&
+    (SENSITIVE_KEYS.has(k) ||
+      k.includes('token') ||
+      k.includes('cookie') ||
+      k.includes('auth') ||
+      k.includes('secret') ||
+      k.includes('password') ||
+      k.includes('apikey') ||
+      k.includes('api_key'))
+  ) {
+    if (typeof value === 'string') return redactValue(value);
+    return '[REDACTED]';
+  }
+  return value;
+}
+
 function getLogger(debug?: RequestOptions['debug']): ((msg: string, meta?: Record<string, any>) => void) | undefined {
   if (!debug) return undefined;
   if (typeof debug === 'function') return debug;
@@ -161,9 +180,16 @@ export async function request<T = unknown>(opts: RequestOptions): Promise<HttpRe
   let body: any = opts.body;
   // When using JSON payloads, serialize once so we can optionally log a safe preview when debug is enabled.
   let debugBodyString: string | undefined;
+  let bodyString: string | undefined;
   if (opts.json !== undefined) {
-    debugBodyString = JSON.stringify(opts.json);
-    body = Buffer.from(debugBodyString);
+    // Use a redacted version for debug logs, but send the original JSON to the server.
+    try {
+      debugBodyString = JSON.stringify(opts.json, redactJsonPreview);
+    } catch {
+      debugBodyString = undefined;
+    }
+    bodyString = JSON.stringify(opts.json);
+    body = Buffer.from(bodyString);
     if (!headers['content-type']) headers['content-type'] = 'application/json';
   }
 
@@ -283,7 +309,7 @@ export async function request<T = unknown>(opts: RequestOptions): Promise<HttpRe
 export default request;
 
 // Thin JSON POST helper for convenience consumers (e.g., GraphQL client)
-export type HttpOptions = Pick<RequestOptions, 'baseUrl' | 'headers' | 'token' | 'cookie' | 'timeoutMs' | 'debug'>;
+export type HttpOptions = Pick<RequestOptions, 'baseUrl' | 'headers' | 'token' | 'cookie' | 'timeoutMs' | 'debug' | 'maxAttempts'>;
 
 export async function postJson<T = unknown>(path: string, body: unknown, opts?: HttpOptions): Promise<HttpResponse<T>> {
   // Prefer explicit baseUrl but fall back to AFFINE_BASE_URL env for convenience
@@ -298,6 +324,7 @@ export async function postJson<T = unknown>(path: string, body: unknown, opts?: 
     token: (opts as any)?.token,
     cookie: (opts as any)?.cookie,
     timeoutMs: opts?.timeoutMs,
+    maxAttempts: opts?.maxAttempts,
     debug: opts?.debug,
     responseType: 'json',
   });

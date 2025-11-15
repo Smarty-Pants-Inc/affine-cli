@@ -137,6 +137,16 @@ export class SocketIoTransport implements RealtimeTransport {
     });
   }
 
+  /**
+   * Fire-and-forget emit for events where the server does not provide an ack
+   * payload (e.g. space:delete-doc). This avoids hanging when no ack handler
+   * is registered on the server side.
+   */
+  emitWithoutAck(event: string, payload?: Record<string, any>): void {
+    if (!this.socket) throw new Error('transport not connected');
+    this.socket.emit(event, payload ?? {});
+  }
+
   async close(): Promise<void> {
     if (!this.socket) return;
     const s = this.socket;
@@ -162,11 +172,11 @@ async function ensureTransport(opts: RealtimeOptions): Promise<RealtimeTransport
 }
 
 async function joinWorkspace(transport: RealtimeTransport, workspaceId: string, clientVersion = '1.0.0') {
-  await transport.emit('space:join', {
+  await emitWithAckTimeout(transport, { workspaceId } as any, 'space:join', {
     spaceType: 'workspace',
     spaceId: workspaceId,
     clientVersion,
-  });
+  }, 'space:join');
 }
 
 function extractRealtimeError(ack: any): string | undefined {
@@ -191,6 +201,30 @@ function ensureAckOk(ack: any, op: string): void {
   const err = new Error(`realtime ${op} failed: ${msg}`);
   (err as any).ack = ack;
   throw err;
+}
+
+async function emitWithAckTimeout<T = unknown>(
+  transport: RealtimeTransport,
+  opts: RealtimeOptions,
+  event: string,
+  payload?: Record<string, any>,
+  opName?: string,
+): Promise<T | void> {
+  const ms = Math.max(1, opts.timeoutMs ?? 30_000);
+  let timer: any;
+  try {
+    const p = transport.emit<T>(event, payload);
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`realtime ${opName ?? event} timeout after ${ms}ms`);
+        (err as any).code = 'ETIMEDOUT';
+        reject(err);
+      }, ms);
+    });
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function appendDocMetaToWorkspaceRoot(
@@ -311,13 +345,19 @@ export async function createDoc(opts: CreateDocOptions): Promise<{ docId: string
 
       return Y.encodeStateAsUpdate(spaceDoc);
     })();
-    const res = await transport.emit<{ accepted?: boolean; timestamp?: number; error?: any }>('space:push-doc-update', {
+    const res = await emitWithAckTimeout<{ accepted?: boolean; timestamp?: number; error?: any }>(
+      transport,
+      opts,
+      'space:push-doc-update',
+      {
       spaceType: 'workspace',
       spaceId: workspaceId,
       docId,
       // Socket.IO supports binary; send Buffer to preserve bytes
       update: Buffer.from(update).toString('base64'),
-    });
+      },
+      'space:push-doc-update',
+    );
     ensureAckOk(res, 'space:push-doc-update');
     await appendDocMetaToWorkspaceRoot(transport, workspaceId, docId, opts.title);
     return { docId, timestamp: (res as any)?.timestamp };
@@ -414,12 +454,18 @@ export async function appendText(opts: AppendTextOptions): Promise<{ accepted: b
     });
 
     const update = Y.encodeStateAsUpdate(doc);
-    const res = await transport.emit<{ accepted?: boolean; timestamp?: number; error?: any }>('space:push-doc-update', {
-      spaceType: 'workspace',
-      spaceId: workspaceId,
-      docId: opts.docId,
-      update: Buffer.from(update).toString('base64'),
-    });
+    const res = await emitWithAckTimeout<{ accepted?: boolean; timestamp?: number; error?: any }>(
+      transport,
+      opts,
+      'space:push-doc-update',
+      {
+        spaceType: 'workspace',
+        spaceId: workspaceId,
+        docId: opts.docId,
+        update: Buffer.from(update).toString('base64'),
+      },
+      'space:push-doc-update',
+    );
     ensureAckOk(res, 'space:push-doc-update');
     const accepted = (res as any)?.accepted !== false;
     return { accepted, timestamp: (res as any)?.timestamp };
@@ -441,12 +487,24 @@ export async function deleteDocRealtime(
   let needClose = !opts.transport;
   try {
     await joinWorkspace(transport, workspaceId, clientVersion);
-    const ack = await transport.emit('space:delete-doc', {
+    const payload = {
       spaceType: 'workspace',
       spaceId: workspaceId,
       docId: opts.docId,
-    });
-    ensureAckOk(ack, 'space:delete-doc');
+    };
+
+    // Many AFFiNE deployments handle space:delete-doc as a fire-and-forget
+    // realtime signal without an explicit ack payload. If we wait on an ack
+    // that never arrives, the CLI will hang or timeout. For the default
+    // Socket.IO transport, emit without expecting an ack; for custom
+    // transports used in tests, fall back to the regular emit so failures are
+    // still surfaced.
+    const anyTransport: any = transport as any;
+    if (typeof anyTransport.emitWithoutAck === 'function') {
+      anyTransport.emitWithoutAck('space:delete-doc', payload);
+    } else {
+      await transport.emit('space:delete-doc', payload);
+    }
     return { ok: true };
   } finally {
     if (needClose) await transport.close();

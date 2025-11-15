@@ -12,6 +12,7 @@
  */
 
 import { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import request, { type RequestOptions, type HttpOptions } from './http';
@@ -57,8 +58,20 @@ function guessContentType(nameOrPath: string): string {
 type BlobAliasMap = Record<string, Record<string, string>>; // workspaceId -> alias -> key
 
 function aliasFilePath(): string {
-  // Store aliases alongside the CLI package by default so multiple invocations
-  // (e.g., smoke tests) can share them.
+  // Prefer a per-user config directory for alias mapping to avoid polluting
+  // arbitrary working directories and to keep keys out of project trees.
+  const envPath = (typeof process !== 'undefined' && process?.env?.AFFINE_CLI_BLOBS_PATH)
+    ? String(process.env.AFFINE_CLI_BLOBS_PATH)
+    : undefined;
+  if (envPath) return path.resolve(envPath);
+
+  try {
+    const home = os.homedir();
+    if (home) return path.join(home, '.affine', 'cli', 'blobs.json');
+  } catch {
+    // fall back to CWD-based path below
+  }
+
   const cwd = typeof process?.cwd === 'function' ? process.cwd() : '.';
   return path.resolve(cwd, '.affine-cli-blobs.json');
 }
@@ -82,7 +95,14 @@ async function saveAliasMap(map: BlobAliasMap): Promise<void> {
   } catch {
     // ignore mkdir errors; writeFile below will surface issues
   }
-  await fs.writeFile(file, JSON.stringify(map, null, 2), 'utf8');
+  const json = JSON.stringify(map, null, 2);
+  // Best-effort: store alias file with owner-only permissions.
+  await fs.writeFile(file, json, { encoding: 'utf8', mode: 0o600 });
+  try {
+    await fs.chmod(file, 0o600);
+  } catch {
+    // ignore chmod failures on non-POSIX filesystems
+  }
 }
 
 async function registerAlias(workspaceId: string, alias: string, key: string): Promise<void> {
@@ -201,6 +221,7 @@ export async function upload(
       token: (opts as any)?.token,
       cookie: (opts as any)?.cookie,
       timeoutMs: (opts as any)?.timeoutMs,
+      maxAttempts: (opts as any)?.maxAttempts,
       debug: (opts as any)?.debug,
       responseType: 'json',
     },
@@ -252,6 +273,7 @@ export async function get(
     token: (opts as any).token,
     cookie: (opts as any).cookie,
     timeoutMs: (opts as any).timeoutMs,
+    maxAttempts: (opts as any).maxAttempts,
     debug: (opts as any).debug,
     responseType: 'buffer',
     // Do not auto-follow redirects in http.ts; we handle explicitly
@@ -285,6 +307,7 @@ export async function get(
     method: 'GET',
     headers: { ...(opts as any).headers },
     timeoutMs: (opts as any).timeoutMs,
+    maxAttempts: (opts as any).maxAttempts,
     debug: (opts as any).debug,
     responseType: 'buffer',
   });
@@ -319,6 +342,7 @@ export async function rm(
       token: (opts as any)?.token,
       cookie: (opts as any)?.cookie,
       timeoutMs: (opts as any)?.timeoutMs,
+      maxAttempts: (opts as any)?.maxAttempts,
       debug: (opts as any)?.debug,
       responseType: 'json',
     },

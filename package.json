@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "description": "Command-line interface for AFFiNE workspaces and documents.",
   "author": "Smarty Pants Inc.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": false,
   "bin": {
     "affine": "dist/index.js"

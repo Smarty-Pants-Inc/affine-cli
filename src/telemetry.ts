@@ -29,7 +29,7 @@ export async function captureEvent(evt: TelemetryEvent): Promise<void> {
         node: process.version,
         platform: process.platform,
         arch: process.arch,
-        pkg: '@smarty/affine-cli',
+        pkg: 'affine-cli',
       },
     };
     await request({ url, method: 'POST', headers: { 'content-type': 'application/json' }, json: payload, timeoutMs: 2000, responseType: 'json' });
@@ -73,7 +73,19 @@ function sanitize(obj: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(obj)) {
     const key = String(k).toLowerCase();
-    if (key.includes('token') || key.includes('cookie') || key.includes('auth')) continue;
+    if (
+      key.includes('token') ||
+      key.includes('cookie') ||
+      key.includes('auth') ||
+      key.includes('secret') ||
+      key.includes('password') ||
+      key.includes('pass') ||
+      key.includes('apikey') ||
+      key.includes('api_key') ||
+      key.includes('session')
+    ) {
+      continue;
+    }
     out[k] = v;
   }
   return out;
