@@ -8,7 +8,7 @@ vi.mock('../src/http', () => {
   };
 });
 
-import { get, rm } from '../src/blobs';
+import { get, rm, upload } from '../src/blobs';
 import request from '../src/http';
 
 const requestMock = request as any;
@@ -154,5 +154,24 @@ describe('blobs alias resolution', () => {
 
     await expect(rm(workspaceId, alias, { baseUrl: 'http://example' } as any)).rejects.toThrow('You must sign in first');
     expect(requestMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('upload surfaces GraphQL setBlob errors instead of fabricating success', async () => {
+    const workspaceId = 'ws-blobs-upload';
+    const name = 'upload-alias.txt';
+
+    // setBlob mutation returns a GraphQL errors envelope
+    requestMock.mockImplementationOnce(async (opts: any) => {
+      expect(opts.path).toBe('/graphql');
+      const payload = {
+        errors: [{ message: 'You must sign in first' }],
+      };
+      return mkJsonResponse(payload);
+    });
+
+    await expect(upload(workspaceId, name, Buffer.from('data'), { baseUrl: 'http://example' } as any)).rejects.toThrow(
+      'You must sign in first',
+    );
+    expect(requestMock).toHaveBeenCalledTimes(1);
   });
 });

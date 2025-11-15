@@ -78,16 +78,31 @@ export async function keywordSearchWithFallback(
 
   // 4) Last-resort fallback: scan markdown content of recently updated docs via MCP read_document
   //    This compensates for indexer lag or configs where searchDocs only indexes titles/summary.
-  if (items.length === 0) {
+  const maxItems = typeof first === 'number' && first > 0 ? first : undefined;
+  const shouldScanContent =
+    // Always scan when upstream layers returned nothing, and also
+    // supplement GraphQL results to compensate for indexer lag.
+    (items.length === 0 || source === 'graphql') &&
+    (typeof maxItems === 'undefined' || items.length < maxItems);
+
+  if (shouldScanContent) {
     try {
       const tools = await toolsList(workspaceId, httpOpts);
       if (tools.find((t) => t.name === 'read_document')) {
         const conn = docsConn ?? (await listRecentlyUpdatedDocs(workspaceId, first, undefined, httpOpts));
         const q = String(query).toLowerCase();
         const matches: KeywordSearchItem[] = [];
+        const itemsBeforeScan = items.length;
+        const seen = new Set<string>();
+        for (const it of items as any[]) {
+          const id = (it?.docId ?? it?.id) as string | undefined;
+          if (id) seen.add(String(id));
+        }
+        const remaining = typeof maxItems === 'number' ? Math.max(0, maxItems - items.length) : Number.POSITIVE_INFINITY;
         for (const edge of conn.edges ?? []) {
           const node = edge.node;
           const docId = node.id;
+          if (seen.has(docId)) continue;
           try {
             const { markdown } = await readDocument(workspaceId, docId, httpOpts);
             const text = String(markdown || '');
@@ -102,15 +117,17 @@ export async function keywordSearchWithFallback(
                 title: node.title ?? null,
                 snippet,
               });
-              if (typeof first === 'number' && matches.length >= first) break;
+              if (matches.length >= remaining) break;
             }
           } catch {
             // ignore per-doc failures and continue scanning others
           }
         }
         if (matches.length > 0) {
-          items = matches;
-          source = 'fallback';
+          items = itemsBeforeScan ? items.concat(matches) : matches;
+          if (itemsBeforeScan === 0 && source !== 'mcp') {
+            source = 'fallback';
+          }
         }
       }
     } catch {

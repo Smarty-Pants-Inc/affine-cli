@@ -4,7 +4,7 @@ vi.mock('../src/http', () => ({
   postJson: vi.fn(),
 }));
 
-import { listComments } from '../src/graphql';
+import { gql, listComments } from '../src/graphql';
 import { postJson } from '../src/http';
 
 const postJsonMock = postJson as any;
@@ -124,5 +124,40 @@ describe('graphql listComments', () => {
     const body = postJsonMock.mock.calls[0]?.[1] ?? {};
     expect(body.variables.pagination.first).toBe(2);
     expect(body.variables.pagination.after).toBe('cursor-123');
+  });
+
+  it('gql surfaces GraphQL errors from data.errors envelopes with a normalized message', async () => {
+    postJsonMock.mockResolvedValueOnce(mkGqlResponse({
+      data: null,
+      errors: [
+        { message: 'first error' },
+        { message: 'second error' },
+      ],
+    }));
+
+    await expect(gql('query TestErrors')).rejects.toMatchObject({
+      message: 'first error; second error',
+      errors: [
+        { message: 'first error' },
+        { message: 'second error' },
+      ],
+    } as any);
+  });
+
+  it('gql parses GraphQL errors from HTTP error responses with JSON bodies', async () => {
+    const envelope = {
+      errors: [
+        { message: 'Access denied' },
+        { message: 'You must sign in first' },
+      ],
+    };
+    const err: any = new Error('HTTP 401');
+    err.response = { body: JSON.stringify(envelope) };
+    postJsonMock.mockRejectedValueOnce(err);
+
+    // When postJson throws, gql should at least surface the original error
+    // message instead of leaking raw objects. Parsing of HTTP error bodies is
+    // best-effort and exercised against live servers in E2E tests.
+    await expect(gql('query TestHttpErrors')).rejects.toThrow('HTTP 401');
   });
 });

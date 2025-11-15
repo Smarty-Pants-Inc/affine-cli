@@ -4,27 +4,93 @@
 // Declare process to avoid requiring @types/node in the initial skeleton
 declare const process: any;
 
+import { spawn } from 'node:child_process';
 import { Command, Option } from 'commander';
-import { listWorkspaces, listDocs, createWorkspace, getWorkspace, updateWorkspace, getDoc, deleteDoc, publishDoc, revokePublicDoc, listComments, addComment, removeComment } from './graphql';
+import { listWorkspaces, listDocs, createWorkspace, getWorkspace, updateWorkspace, getDoc, publishDoc, revokePublicDoc, listComments, addComment, removeComment } from './graphql';
 import { readDocument, semanticSearch } from './mcp';
-import { loadConfig } from './config';
+import { loadConfig, writeConfigProfile } from './config';
 import { redactConfigDeep } from './credentials';
 import { whoami as whoAmIFunc, tokens } from './auth';
-import { createDoc as yCreateDoc, appendText as yAppendText } from './yjs';
+import { createDoc as yCreateDoc, appendText as yAppendText, deleteDocRealtime as yDeleteDoc } from './yjs';
 import { upload as blobUpload, get as blobGet, rm as blobRm } from './blobs';
 import { toJsonList, toTable } from './format';
 import { withHints } from './errors';
 import { withTelemetry } from './telemetry';
 import { keywordSearchWithFallback } from './search';
 
-function httpFromOpts(opts: any): any {
+async function httpFromOpts(opts: any): Promise<any> {
+  const env = (process as any)?.env ?? {};
+
+  // Map CLI flag --base-url to config.apiBaseUrl overrides so loadConfig
+  // can participate in the precedence chain (defaults < file < env < flags).
+  const overrides: Record<string, any> = {};
+  if (Object.prototype.hasOwnProperty.call(opts, 'baseUrl') && (opts as any).baseUrl) {
+    overrides.apiBaseUrl = (opts as any).baseUrl;
+  }
+
+  const cfg = await loadConfig({ profile: (opts as any).profile, overrides });
+
+  const baseUrl =
+    (opts as any).baseUrl ||
+    env.AFFINE_BASE_URL ||
+    (cfg as any).apiBaseUrl;
+
+  const token =
+    (opts as any).token ||
+    env.AFFINE_TOKEN ||
+    (cfg as any).token;
+
+  const cookie =
+    (opts as any).cookie ||
+    env.AFFINE_COOKIE ||
+    (cfg as any).cookie;
+
   return {
-    baseUrl: (opts as any).baseUrl || (process as any)?.env?.AFFINE_BASE_URL,
-    token: (opts as any).token || (process as any)?.env?.AFFINE_TOKEN,
-    cookie: (opts as any).cookie || (process as any)?.env?.AFFINE_COOKIE,
+    baseUrl,
+    token,
+    cookie,
     timeoutMs: (opts as any).timeout,
     debug: (opts as any).verbose,
   };
+}
+
+function deriveUiUrl(apiBaseUrl?: string): string | undefined {
+  if (!apiBaseUrl) return undefined;
+  try {
+    const u = new URL(apiBaseUrl);
+    // Many deployments mount the API under /api; strip that so we land on the
+    // main web app instead of a raw API endpoint.
+    if (u.pathname === '/api' || u.pathname.startsWith('/api/')) {
+      const rest = u.pathname.replace(/^\/api/, '') || '/';
+      u.pathname = rest;
+    }
+    u.search = '';
+    u.hash = '';
+    return u.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function openBrowser(url: string): void {
+  try {
+    const platform = (process as any)?.platform || process.platform;
+    if (platform === 'darwin') {
+      spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
+    } else if (platform === 'win32') {
+      spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true }).unref();
+    } else {
+      spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+    }
+  } catch {
+    // Best-effort only; if we cannot open a browser, the printed URL is still useful.
+  }
+}
+
+function cliError(err: unknown, hints?: string[]): Error {
+  const msg = String((err as any)?.message || err || 'Unknown error');
+  if (!hints || hints.length === 0) return new Error(msg);
+  return new Error(withHints(msg, hints));
 }
 
 const program = new Command();
@@ -73,9 +139,17 @@ program
     }
     const cfg = await loadConfig({ profile: (opts as any).profile, overrides });
     const redacted = redactConfigDeep(cfg);
+    const resolvedProfile =
+      (opts as any).profile ??
+      (redacted as any).profile ??
+      (process as any)?.env?.AFFINE_PROFILE ??
+      'default';
+    if (typeof (redacted as any).profile === 'undefined') {
+      (redacted as any).profile = resolvedProfile;
+    }
     if ((opts as any).json) {
       const optionSnapshot = {
-        profile: (opts as any).profile ?? redacted.profile,
+        profile: resolvedProfile,
         apiBaseUrl: (opts as any).baseUrl ?? redacted.apiBaseUrl,
         workspaceId: (opts as any).workspaceId ?? (process as any)?.env?.AFFINE_WORKSPACE_ID,
         timeout: (opts as any).timeout,
@@ -99,13 +173,20 @@ ws
   .description('List workspaces')
   .action(withTelemetry('ws/list', async function (this: Command) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
-    const items = await listWorkspaces(httpOpts);
-    if ((opts as any).json) {
-      console.log(JSON.stringify(toJsonList(items), null, 2));
-    } else {
-      const rows = items.map((w) => ({ id: w.id, embeddings: w.enableDocEmbedding ? 'on' : 'off' }));
-      for (const line of toTable(rows, ['id', 'embeddings'])) console.log(line);
+    const httpOpts: any = await httpFromOpts(opts);
+    try {
+      const items = await listWorkspaces(httpOpts);
+      if ((opts as any).json) {
+        console.log(JSON.stringify(toJsonList(items), null, 2));
+      } else {
+        const rows = items.map((w) => ({ id: w.id, embeddings: w.enableDocEmbedding ? 'on' : 'off' }));
+        for (const line of toTable(rows, ['id', 'embeddings'])) console.log(line);
+      }
+    } catch (e) {
+      throw cliError(e, [
+        'Check AFFINE_BASE_URL and your network connectivity.',
+        'If using an API token or cookie, ensure it is valid and not expired.',
+      ]);
     }
   }));
 
@@ -114,7 +195,7 @@ ws
   .description('Create a workspace')
   .action(async function (this: Command) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const w = await createWorkspace(httpOpts);
     if ((opts as any).json) {
       console.log(JSON.stringify(w, null, 2));
@@ -129,13 +210,20 @@ ws
   .argument('<id>')
   .action(withTelemetry('ws/get', async function (this: Command, id: string) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
-    const w = await getWorkspace(id, httpOpts);
-    if (!w) throw new Error('workspace not found');
-    if ((opts as any).json) {
-      console.log(JSON.stringify(w, null, 2));
-    } else {
-      console.log(`${w.id} embeddings:${w.enableDocEmbedding ? 'on' : 'off'}`);
+    const httpOpts: any = await httpFromOpts(opts);
+    try {
+      const w = await getWorkspace(id, httpOpts);
+      if (!w) throw new Error('workspace not found');
+      if ((opts as any).json) {
+        console.log(JSON.stringify(w, null, 2));
+      } else {
+        console.log(`${w.id} embeddings:${w.enableDocEmbedding ? 'on' : 'off'}`);
+      }
+    } catch (e) {
+      throw cliError(e, [
+        'Verify that the workspace id is correct and that your token or cookie grants access to it.',
+        'Check AFFINE_BASE_URL and your network connectivity.',
+      ]);
     }
   }));
 
@@ -147,12 +235,19 @@ wsEmb
   .argument('<id>')
   .action(withTelemetry('ws/embeddings_enable', async function (this: Command, id: string) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
-    const w = await updateWorkspace({ id, enableDocEmbedding: true }, httpOpts);
-    if ((opts as any).json) {
-      console.log(JSON.stringify(w, null, 2));
-    } else {
-      console.log(`${w.id} embeddings:on`);
+    const httpOpts: any = await httpFromOpts(opts);
+    try {
+      const w = await updateWorkspace({ id, enableDocEmbedding: true }, httpOpts);
+      if ((opts as any).json) {
+        console.log(JSON.stringify(w, null, 2));
+      } else {
+        console.log(`${w.id} embeddings:on`);
+      }
+    } catch (e) {
+      throw cliError(e, [
+        'Ensure embeddings are supported by your AFFiNE server and workspace.',
+        'Check AFFINE_BASE_URL, credentials, and server logs for validation errors.',
+      ]);
     }
   }));
 
@@ -162,12 +257,19 @@ wsEmb
   .argument('<id>')
   .action(withTelemetry('ws/embeddings_disable', async function (this: Command, id: string) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
-    const w = await updateWorkspace({ id, enableDocEmbedding: false }, httpOpts);
-    if ((opts as any).json) {
-      console.log(JSON.stringify(w, null, 2));
-    } else {
-      console.log(`${w.id} embeddings:off`);
+    const httpOpts: any = await httpFromOpts(opts);
+    try {
+      const w = await updateWorkspace({ id, enableDocEmbedding: false }, httpOpts);
+      if ((opts as any).json) {
+        console.log(JSON.stringify(w, null, 2));
+      } else {
+        console.log(`${w.id} embeddings:off`);
+      }
+    } catch (e) {
+      throw cliError(e, [
+        'Ensure embeddings are supported by your AFFiNE server and workspace.',
+        'Check AFFINE_BASE_URL, credentials, and server logs for validation errors.',
+      ]);
     }
   }));
 
@@ -183,16 +285,23 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const first = (opts as any).first as number | undefined;
     const after = (opts as any).after as string | undefined;
-    const conn = await listDocs(workspaceId, first, after, httpOpts);
-    if ((opts as any).json) {
-      const nodes = (conn.edges ?? []).map((e) => e.node);
-      console.log(JSON.stringify(toJsonList(nodes, conn.pageInfo), null, 2));
-    } else {
-      const rows = (conn.edges ?? []).map((e) => ({ id: e.node.id, title: e.node.title ?? '' }));
-      for (const line of toTable(rows, ['id', 'title'])) console.log(line);
+    try {
+      const conn = await listDocs(workspaceId, first, after, httpOpts);
+      if ((opts as any).json) {
+        const nodes = (conn.edges ?? []).map((e) => e.node);
+        console.log(JSON.stringify(toJsonList(nodes, conn.pageInfo), null, 2));
+      } else {
+        const rows = (conn.edges ?? []).map((e) => ({ id: e.node.id, title: e.node.title ?? '' }));
+        for (const line of toTable(rows, ['id', 'title'])) console.log(line);
+      }
+    } catch (e) {
+      throw cliError(e, [
+        'Verify that the workspace id is correct and reachable.',
+        'Check AFFINE_BASE_URL, credentials, and server logs for GraphQL errors.',
+      ]);
     }
   }));
 
@@ -204,13 +313,23 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     try {
+      const ws = await getWorkspace(workspaceId, httpOpts);
+      if (ws && !ws.enableDocEmbedding) {
+        throw new Error(`Embeddings are disabled for workspace ${workspaceId}`);
+      }
+
       const { markdown } = await readDocument(workspaceId, docId, httpOpts);
+      const text = String(markdown ?? '');
+      const lower = text.toLowerCase();
+      if (lower.includes('doc with id') && lower.includes('not found')) {
+        throw new Error(`Doc ${docId} not found`);
+      }
       if ((opts as any).json) {
-        console.log(JSON.stringify({ docId, markdown }, null, 2));
+        console.log(JSON.stringify({ docId, markdown: text }, null, 2));
       } else {
-        console.log(markdown ?? '');
+        console.log(text);
       }
     } catch (e: any) {
       const msg = String(e?.message || 'Failed to read document as Markdown');
@@ -231,13 +350,20 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
-    const doc = await getDoc(workspaceId, docId, httpOpts);
-    if (!doc) throw new Error('doc not found');
-    if ((opts as any).json) {
-      console.log(JSON.stringify(doc, null, 2));
-    } else {
-      console.log(`${doc.id}${doc.title ? ' ' + doc.title : ''}`.trim());
+    const httpOpts: any = await httpFromOpts(opts);
+    try {
+      const doc = await getDoc(workspaceId, docId, httpOpts);
+      if (!doc) throw new Error('doc not found');
+      if ((opts as any).json) {
+        console.log(JSON.stringify(doc, null, 2));
+      } else {
+        console.log(`${doc.id}${doc.title ? ' ' + doc.title : ''}`.trim());
+      }
+    } catch (e) {
+      throw cliError(e, [
+        'Ensure the document id is correct and the workspace is accessible.',
+        'If the doc was recently deleted, allow a moment for indexes to update.',
+      ]);
     }
   }));
 
@@ -249,10 +375,21 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
-    const ok = await deleteDoc(workspaceId, docId, httpOpts);
-    if ((opts as any).json) console.log(JSON.stringify({ ok }, null, 2));
-    else console.log(ok ? 'Deleted' : 'Not deleted');
+    const httpOpts: any = await httpFromOpts(opts);
+    try {
+      const res = await yDeleteDoc({ workspaceId, docId, ...httpOpts });
+      const ok = res?.ok !== false;
+      if ((opts as any).json) console.log(JSON.stringify({ ok }, null, 2));
+      else console.log(ok ? 'Deleted' : 'Not deleted');
+    } catch (e: any) {
+      const msg = String(e?.message || 'Failed to delete document');
+      throw new Error(
+        withHints(msg, [
+          'Ensure you have permission to delete this document.',
+          'Check server logs for doc storage or indexer errors.',
+        ]),
+      );
+    }
   }));
 
 docCmd
@@ -264,7 +401,7 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const mode = (opts as any).mode as 'Page' | 'Edgeless';
     try {
       let res = await publishDoc(workspaceId, docId, mode, httpOpts);
@@ -289,7 +426,7 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const res = await revokePublicDoc(workspaceId, docId, httpOpts);
     if ((opts as any).json) console.log(JSON.stringify(res, null, 2));
     else console.log(`${res.id}`);
@@ -305,7 +442,7 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const title = (opts as any).title as string;
     const content = (opts as any).content as string | undefined;
     const { docId, timestamp } = await yCreateDoc({ workspaceId, title, content, ...httpOpts } as any);
@@ -322,7 +459,7 @@ docCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const text = (opts as any).text as string;
     const { accepted, timestamp } = await yAppendText({ workspaceId, docId, text, ...httpOpts } as any);
     if ((opts as any).json) console.log(JSON.stringify({ accepted, timestamp }, null, 2));
@@ -342,7 +479,7 @@ commentCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const first = (opts as any).first as number | undefined;
     const after = (opts as any).after as string | undefined;
     const conn = await listComments(workspaceId, docId, first, after, httpOpts);
@@ -364,7 +501,7 @@ commentCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const text = (opts as any).text as string;
     const id = await addComment(workspaceId, docId, text, httpOpts);
     if ((opts as any).json) console.log(JSON.stringify({ id }, null, 2));
@@ -380,7 +517,7 @@ commentCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const id = (opts as any).id as string;
     const ok = await removeComment(workspaceId, docId, id, httpOpts);
     if ((opts as any).json) console.log(JSON.stringify({ ok }, null, 2));
@@ -398,13 +535,7 @@ searchCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = {
-      baseUrl: (opts as any).baseUrl,
-      token: (opts as any).token,
-      cookie: (opts as any).cookie,
-      timeoutMs: (opts as any).timeout,
-      debug: (opts as any).verbose,
-    };
+    const httpOpts: any = await httpFromOpts(opts);
     // Pre-check embeddings flag for friendlier guidance
     const ws = await getWorkspace(workspaceId, httpOpts);
     if (!ws?.enableDocEmbedding) {
@@ -430,8 +561,7 @@ searchCmd
         }
       }
     } catch (e: any) {
-      const msg = String(e?.message || 'Semantic search failed');
-      throw new Error(withHints(msg, ['If embeddings are configured, retry later or check server logs.']));
+      throw cliError(e, ['If embeddings are configured, retry later or check server logs.']);
     }
   }));
 
@@ -447,27 +577,33 @@ searchCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const firstOpt = (opts as any).first as number | undefined;
 
-    const result = await keywordSearchWithFallback(workspaceId, query, firstOpt, httpOpts);
-    source = result.source;
-    items = result.items;
+    try {
+      const result = await keywordSearchWithFallback(workspaceId, query, firstOpt, httpOpts);
+      source = result.source;
+      items = result.items;
 
-    if ((opts as any).json) {
-      console.log(JSON.stringify({ query: result.query, source, total: items.length, items }, null, 2));
-    } else {
-      if (source !== 'graphql') {
-        // Guidance without affecting JSON outputs
-        console.error(
-          `Note: keyword search source = ${source}. To enable GraphQL indexer search, ensure AFFINE_INDEXER_ENABLED=true and search provider configured.`,
-        );
+      if ((opts as any).json) {
+        console.log(JSON.stringify({ query: result.query, source, total: items.length, items }, null, 2));
+      } else {
+        if (source !== 'graphql') {
+          // Guidance without affecting JSON outputs
+          console.error(
+            `Note: keyword search source = ${source}. To enable GraphQL indexer search, ensure AFFINE_INDEXER_ENABLED=true and search provider configured.`,
+          );
+        }
+        const rows = items.map((it) => ({
+          docId: (it as any).docId ?? (it as any).id ?? '',
+          title: (it as any).title ?? (it as any).highlight ?? (it as any).snippet ?? '',
+        }));
+        for (const line of toTable(rows, ['docId', 'title'])) console.log(line);
       }
-      const rows = items.map((it) => ({
-        docId: (it as any).docId ?? (it as any).id ?? '',
-        title: (it as any).title ?? (it as any).highlight ?? (it as any).snippet ?? '',
-      }));
-      for (const line of toTable(rows, ['docId', 'title'])) console.log(line);
+    } catch (e) {
+      throw cliError(e, [
+        'Check GraphQL indexer status, MCP search tools, and server logs for search-related errors.',
+      ]);
     }
     }, () => ({ source, total: items.length })).call(this);
   });
@@ -484,11 +620,18 @@ blobCmd
     const opts = this.optsWithGlobals();
     const workspaceId = getWorkspaceIdFrom(opts);
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const name = (opts as any).name as string;
-    const res = await blobUpload(workspaceId, name, filePath, httpOpts);
-    if ((opts as any).json) console.log(JSON.stringify({ ok: res.ok, name, status: res.status }, null, 2));
-    else console.log('Uploaded');
+    try {
+      const res = await blobUpload(workspaceId, name, filePath, httpOpts);
+      if ((opts as any).json) console.log(JSON.stringify({ ok: res.ok, name, status: res.status }, null, 2));
+      else console.log('Uploaded');
+    } catch (e) {
+      throw cliError(e, [
+        'Verify that the workspace id is correct and you have permission to upload blobs.',
+        'Check AFFINE_BASE_URL and server logs for GraphQL upload errors.',
+      ]);
+    }
   }));
 
 blobCmd
@@ -501,14 +644,21 @@ blobCmd
     const opts = this.optsWithGlobals();
     const workspaceId = (opts as any).workspaceId;
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const name = (opts as any).name as string;
     const outPath = (opts as any).out as string;
     const redirect = (opts as any).redirect as 'follow' | 'manual';
-    const res = await blobGet(workspaceId, name, { ...httpOpts, outPath, redirect });
-    if ((opts as any).json) console.log(JSON.stringify(res, null, 2));
-    else if ((res as any).ok) console.log(outPath);
-    else console.log((res as any).location ?? '');
+    try {
+      const res = await blobGet(workspaceId, name, { ...httpOpts, outPath, redirect });
+      if ((opts as any).json) console.log(JSON.stringify(res, null, 2));
+      else if ((res as any).ok) console.log(outPath);
+      else console.log((res as any).location ?? '');
+    } catch (e) {
+      throw cliError(e, [
+        'Verify that the workspace id and blob name are correct.',
+        'Check AFFINE_BASE_URL, credentials, and server logs for storage or redirect errors.',
+      ]);
+    }
   }));
 
 blobCmd
@@ -519,11 +669,18 @@ blobCmd
     const opts = this.optsWithGlobals();
     const workspaceId = (opts as any).workspaceId;
     if (!workspaceId) throw new Error('workspace-id is required');
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const name = (opts as any).name as string;
-    const ok = await blobRm(workspaceId, name, httpOpts);
-    if ((opts as any).json) console.log(JSON.stringify({ ok }, null, 2));
-    else console.log(ok ? 'Deleted' : 'Not deleted');
+    try {
+      const ok = await blobRm(workspaceId, name, httpOpts);
+      if ((opts as any).json) console.log(JSON.stringify({ ok }, null, 2));
+      else console.log(ok ? 'Deleted' : 'Not deleted');
+    } catch (e) {
+      throw cliError(e, [
+        'Verify that the workspace id and blob name are correct.',
+        'Check AFFINE_BASE_URL, credentials, and server logs for deleteBlob GraphQL errors.',
+      ]);
+    }
   }));
 
 // whoami
@@ -532,7 +689,7 @@ program
   .description('Show the current authenticated user')
   .action(withTelemetry('whoami', async function (this: Command) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const me = await whoAmIFunc(httpOpts);
     if ((opts as any).json) {
       console.log(JSON.stringify(me, null, 2));
@@ -548,27 +705,196 @@ program
 // auth commands
 const authCmd = program.command('auth').description('Authentication commands');
 
-// auth login (stub)
+// auth login
 authCmd
   .command('login')
-  .description('Login (interactive) — stub guidance for now')
-  .action(function (this: Command) {
+  .description('Login by storing credentials in the AFFiNE CLI config profile')
+  .option('--open-browser', 'Open the AFFiNE web UI to help you create a token', false)
+  .option('--validate', 'Validate credentials by calling whoami after writing', false)
+  .action(withTelemetry('auth/login', async function (this: Command) {
     const opts = this.optsWithGlobals();
-    const guidance = {
-      ok: true,
-      message:
-        'Login flow is not implemented yet. Use an access token or cookie via --token/--cookie flags or AFFINE_TOKEN/AFFINE_COOKIE env vars.',
-      hints: [
-        'Example: AFFINE_TOKEN=... affine whoami',
-        'To generate a token: affine auth token create --name cli',
-      ],
-    } as any;
-    if ((opts as any).json) console.log(JSON.stringify(guidance, null, 2));
-    else {
-      console.log(guidance.message);
-      for (const h of guidance.hints) console.log(`  - ${h}`);
+    const isJson = Boolean((opts as any).json);
+
+    const profileFlag = (opts as any).profile as string | undefined;
+    let token = (opts as any).token as string | undefined;
+    let cookie = (opts as any).cookie as string | undefined;
+    let apiBaseUrl = (opts as any).baseUrl as string | undefined;
+    const validate = Boolean((opts as any).validate);
+    const openUi = Boolean((opts as any).openBrowser);
+
+    // When no token/cookie provided, fall back to interactive prompt on TTY.
+    if (!token && !cookie) {
+      const stdin = (process as any)?.stdin;
+      const isTTY = stdin && typeof stdin.isTTY === 'boolean' ? Boolean(stdin.isTTY) : true;
+      if (!isTTY) {
+        const msg =
+          'No token or cookie provided and stdin is not a TTY. Provide --token/--cookie flags or AFFINE_TOKEN/AFFINE_COOKIE env vars.';
+        if (isJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+        else console.error(msg);
+        (process as any).exitCode = 1;
+        return;
+      }
+
+      // Interactive path: prompt for token and optional base URL (with sensible default).
+      const { createInterface } = await import('node:readline/promises');
+      const rl = createInterface({ input: (process as any).stdin, output: (process as any).stdout });
+      try {
+        // Suggest where to obtain a token and optionally open the web UI.
+        let existingCfgBase: string | undefined;
+        try {
+          const cfg = await loadConfig({ profile: profileFlag });
+          existingCfgBase = cfg.apiBaseUrl;
+        } catch {
+          existingCfgBase = undefined;
+        }
+        const defaultBaseUrl = existingCfgBase || 'https://api.affine.pro';
+        const uiUrl = deriveUiUrl(defaultBaseUrl);
+        if (uiUrl) {
+          console.log(
+            `To obtain an AFFiNE access token, open ${uiUrl} in your browser, sign in, ` +
+              'and create a token from the account/settings UI. Then paste it below.',
+          );
+          if (openUi) {
+            openBrowser(uiUrl);
+          }
+        } else {
+          console.log(
+            'To obtain an AFFiNE access token, sign in to your AFFiNE web app, create an access token, and paste it below.',
+          );
+        }
+
+        const tokenAnswer = (await rl.question('AFFiNE access token: ')).trim();
+        if (tokenAnswer) token = tokenAnswer;
+
+        // Use existing config (if any) to provide a default base URL hint.
+        let baseHint = existingCfgBase || 'https://api.affine.pro';
+        const basePrompt = `Base URL [${baseHint}]: `;
+        const baseAnswer = (await rl.question(basePrompt)).trim();
+        if (baseAnswer) apiBaseUrl = baseAnswer;
+        else if (!apiBaseUrl) apiBaseUrl = baseHint;
+      } finally {
+        rl.close();
+      }
     }
-  });
+
+    if (!token && !cookie) {
+      const msg =
+        'No token or cookie provided. Provide --token/--cookie flags or enter a non-empty token when prompted.';
+      if (isJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+      else console.error(msg);
+      (process as any).exitCode = 1;
+      return;
+    }
+
+    try {
+      const writeResult = await writeConfigProfile({
+        profile: profileFlag ?? '',
+        apiBaseUrl,
+        token,
+        cookie,
+      });
+
+      let validationSummary: { ok: boolean; userId?: string | null; error?: string } | undefined;
+      if (validate) {
+        try {
+          const httpOpts: any = await httpFromOpts({
+            ...opts,
+            baseUrl: apiBaseUrl ?? (opts as any).baseUrl,
+            token,
+            cookie,
+            profile: writeResult.profile,
+          });
+          const me = await whoAmIFunc(httpOpts);
+          if (me && me.id) {
+            validationSummary = { ok: true, userId: me.id ?? null };
+          } else {
+            validationSummary = { ok: false, userId: null };
+          }
+        } catch (e: any) {
+          validationSummary = { ok: false, error: String(e?.message || e) };
+        }
+      }
+
+      if (isJson) {
+        const payload: any = {
+          ok: true,
+          profile: writeResult.profile,
+          apiBaseUrl:
+            writeResult.profileConfig.apiBaseUrl ??
+            writeResult.config.apiBaseUrl ??
+            apiBaseUrl,
+          tokenSet: Boolean(token && String(token).length > 0),
+          cookieSet: Boolean(cookie && String(cookie).length > 0),
+          configPath: writeResult.path,
+        };
+        if (validate) payload.validation = validationSummary ?? { ok: false };
+        console.log(JSON.stringify(payload, null, 2));
+      } else {
+        console.log(`Saved credentials to profile "${writeResult.profile}" in ${writeResult.path}`);
+        const effectiveBaseUrl =
+          writeResult.profileConfig.apiBaseUrl ?? writeResult.config.apiBaseUrl ?? apiBaseUrl;
+        if (effectiveBaseUrl) console.log(`  apiBaseUrl : ${effectiveBaseUrl}`);
+        if (token) console.log('  token     : [stored]');
+        if (cookie) console.log('  cookie    : [stored]');
+        if (validate && validationSummary) {
+          if (validationSummary.ok) {
+            console.log(`Validation: OK${validationSummary.userId ? ` (${validationSummary.userId})` : ''}`);
+          } else if (validationSummary.error) {
+            console.log(`Validation: unable to confirm credentials (${validationSummary.error})`);
+          } else {
+            console.log('Validation: not authenticated (whoami returned null)');
+          }
+        }
+      }
+    } catch (err: any) {
+      const reason = String(err?.message || 'Unknown error');
+      const friendly = `Failed to update config: ${reason}`;
+      if (isJson) console.log(JSON.stringify({ ok: false, error: friendly }, null, 2));
+      else console.error(friendly);
+      (process as any).exitCode = 1;
+    }
+  }));
+
+// auth logout
+authCmd
+  .command('logout')
+  .description('Remove stored credentials from the AFFiNE CLI config profile')
+  .action(withTelemetry('auth/logout', async function (this: Command) {
+    const opts = this.optsWithGlobals();
+    const isJson = Boolean((opts as any).json);
+    const profileFlag = (opts as any).profile as string | undefined;
+
+    try {
+      const res = await writeConfigProfile({
+        profile: profileFlag ?? '',
+        token: undefined,
+        cookie: undefined,
+      });
+
+      if (isJson) {
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              profile: res.profile,
+              configPath: res.path,
+            },
+            null,
+            2,
+          ),
+        );
+      } else {
+        console.log(`Cleared stored credentials from profile "${res.profile}" in ${res.path}`);
+        console.log('Note: environment variables AFFINE_TOKEN/AFFINE_COOKIE still apply if set.');
+      }
+    } catch (err: any) {
+      const reason = String(err?.message || 'Unknown error');
+      const friendly = `Failed to update config: ${reason}`;
+      if (isJson) console.log(JSON.stringify({ ok: false, error: friendly }, null, 2));
+      else console.error(friendly);
+      (process as any).exitCode = 1;
+    }
+  }));
 
 // auth token subcommands
 const tokenCmd = authCmd.command('token').description('Access token operations');
@@ -578,7 +904,7 @@ tokenCmd
   .description('List access tokens')
   .action(withTelemetry('token/list', async function (this: Command) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const items = await tokens.list(httpOpts);
     if ((opts as any).json) console.log(JSON.stringify(toJsonList(items), null, 2));
     else {
@@ -594,7 +920,7 @@ tokenCmd
   .addOption(new Option('--expires-at <ts>', 'ISO timestamp for expiry'))
   .action(withTelemetry('token/create', async function (this: Command) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const name = (opts as any).name as string;
     const expiresAt = (opts as any).expiresAt as string | undefined;
     const created = await tokens.create(name, expiresAt, httpOpts);
@@ -611,7 +937,7 @@ tokenCmd
   .argument('<id>', 'Token id')
   .action(withTelemetry('token/revoke', async function (this: Command, id: string) {
     const opts = this.optsWithGlobals();
-    const httpOpts: any = httpFromOpts(opts);
+    const httpOpts: any = await httpFromOpts(opts);
     const ok = await tokens.revoke(id, httpOpts);
     if ((opts as any).json) console.log(JSON.stringify({ ok }, null, 2));
     else console.log(ok ? 'Revoked' : 'Not revoked');

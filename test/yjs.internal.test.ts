@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as Y from 'yjs';
 
-import { buildInitialPageUpdate, createDoc, appendText, type RealtimeTransport } from '../src/yjs';
+import { buildInitialPageUpdate, createDoc, appendText, deleteDocRealtime, type RealtimeTransport } from '../src/yjs';
 
 class FakeTransport implements RealtimeTransport {
   public events: { event: string; payload: any }[] = [];
@@ -40,6 +40,26 @@ class FakeTransport implements RealtimeTransport {
       for (const u of updates) Y.applyUpdate(doc, u);
       const combined = Y.encodeStateAsUpdate(doc);
       return { update: Buffer.from(combined) } as any as T;
+    }
+
+    if (event === 'space:load-doc') {
+      const docId = String(payload?.docId ?? '');
+      const updates = this.updatesByDocId.get(docId) ?? [];
+      if (!updates.length) {
+        return {
+          missing: Buffer.alloc(0).toString('base64'),
+          state: Buffer.alloc(0).toString('base64'),
+          timestamp: Date.now(),
+        } as any as T;
+      }
+      const doc = new Y.Doc();
+      for (const u of updates) Y.applyUpdate(doc, u);
+      const combined = Y.encodeStateAsUpdate(doc);
+      return {
+        missing: Buffer.from(combined).toString('base64'),
+        state: Buffer.alloc(0).toString('base64'),
+        timestamp: Date.now(),
+      } as any as T;
     }
 
     // space:join and other events are ignored for tests
@@ -159,3 +179,55 @@ describe('yjs internal page scaffolding', () => {
     expect(texts).toContain(secondContent);
   });
 });
+
+class FailingTransport implements RealtimeTransport {
+  async connect(): Promise<void> {
+    // no-op
+  }
+
+  async close(): Promise<void> {
+    // no-op
+  }
+
+  async emit<T = unknown>(event: string, payload?: Record<string, any>): Promise<T | void> {
+    if (event === 'space:push-doc-update') {
+      return { error: { message: 'push failed (backend error)', op: event, payload } } as any as T;
+    }
+    if (event === 'space:delete-doc') {
+      throw new Error('socket write failed');
+    }
+    if (event === 'space:load-doc') {
+      return {
+        missing: Buffer.alloc(0).toString('base64'),
+        state: Buffer.alloc(0).toString('base64'),
+        timestamp: Date.now(),
+      } as any as T;
+    }
+    return undefined;
+  }
+}
+
+describe('yjs realtime failure handling', () => {
+  it('createDoc surfaces space:push-doc-update ack errors instead of silently succeeding', async () => {
+    const transport = new FailingTransport();
+    await expect(
+      createDoc({ workspaceId: 'ws-yjs-fail', title: 'fail', transport } as any),
+    ).rejects.toThrow(/realtime space:push-doc-update failed: push failed/);
+  });
+
+  it('appendText surfaces space:push-doc-update ack errors for append operations', async () => {
+    const transport = new FailingTransport();
+
+    await expect(
+      appendText({ workspaceId: 'ws-yjs-fail', docId: 'doc-err', text: 'body', transport } as any),
+    ).rejects.toThrow(/realtime space:push-doc-update failed: push failed/);
+  });
+
+  it('deleteDocRealtime propagates transport errors instead of always returning ok', async () => {
+    const transport = new FailingTransport();
+    await expect(
+      deleteDocRealtime({ workspaceId: 'ws-yjs-fail', docId: 'doc-err', transport } as any),
+    ).rejects.toThrow(/socket write failed/);
+  });
+});
+

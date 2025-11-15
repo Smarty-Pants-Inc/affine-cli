@@ -1,6 +1,9 @@
 {
-  "name": "@smarty/affine-cli",
+  "name": "affine-cli",
   "version": "0.1.1",
+  "description": "Command-line interface for AFFiNE workspaces and documents.",
+  "author": "Smarty Pants Inc.",
+  "license": "UNLICENSED",
   "private": false,
   "bin": {
     "affine": "dist/index.js"
@@ -9,16 +12,18 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "src",
     "README.md"
   ],
+  "engines": {
+    "node": ">=20"
+  },
   "publishConfig": {
     "access": "public"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Smarty-Pants-Inc/smarty-dev.git",
-    "directory": "packages/affine-cli"
+    "directory": "projects/affine-cli"
   },
   "bugs": {
     "url": "https://github.com/Smarty-Pants-Inc/smarty-dev/issues"

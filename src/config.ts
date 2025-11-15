@@ -58,8 +58,10 @@ async function readJsonIfExists(filePath: string): Promise<any | undefined> {
   }
 }
 
-function resolveConfigPath(customPath?: string): string {
+export function resolveConfigPath(customPath?: string, env: NodeJS.ProcessEnv = process.env): string {
   if (customPath) return customPath;
+  const explicit = env.AFFINE_CONFIG_PATH || env.AFFINE_CLI_CONFIG_PATH;
+  if (explicit) return explicit;
   const home = os.homedir();
   return path.join(home, '.affine', 'cli', 'config.json');
 }
@@ -100,7 +102,7 @@ export async function loadConfig(opts: LoadConfigOptions = {}): Promise<AffineCo
   let merged: AffineConfig = { ...DEFAULTS };
 
   // 2) file (base + profile)
-  const cfgPath = resolveConfigPath(opts.configPath);
+  const cfgPath = resolveConfigPath(opts.configPath, env);
   const fileCfg = await readJsonIfExists(cfgPath);
   if (fileCfg) {
     const base = pickBaseFromFile(fileCfg);
@@ -133,4 +135,91 @@ export async function loadConfig(opts: LoadConfigOptions = {}): Promise<AffineCo
 // Convenience: synchronous variant that avoids async FS when caller already has file config
 export async function loadConfigForProfile(profile: string, opts: Omit<LoadConfigOptions, 'profile'> = {}): Promise<AffineConfig> {
   return loadConfig({ ...opts, profile });
+}
+
+async function writeJsonAtomic(filePath: string, data: any): Promise<void> {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tmp = path.join(
+    dir,
+    `.config.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`,
+  );
+  const json = JSON.stringify(data, null, 2);
+  await fs.writeFile(tmp, json, 'utf8');
+  await fs.rename(tmp, filePath);
+}
+
+export type WriteConfigProfileOptions = {
+  profile: string;
+  apiBaseUrl?: string;
+  token?: string;
+  cookie?: string;
+  // Optional override path/environment for tests or advanced usage
+  configPath?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
+export type WriteConfigProfileResult = {
+  path: string;
+  profile: string;
+  config: Record<string, any>;
+  profileConfig: Record<string, any>;
+};
+
+/**
+ * Upsert a profile entry in the AFFiNE CLI config file.
+ *
+ * This helper:
+ * - Loads the existing config JSON if present (or starts from an empty object)
+ * - Ensures profiles[profileName] exists
+ * - Updates apiBaseUrl/token/cookie for that profile (only when provided)
+ * - Sets the top-level `profile` field to the selected profile
+ * - Persists the result atomically (write temp file then rename)
+ */
+export async function writeConfigProfile(options: WriteConfigProfileOptions): Promise<WriteConfigProfileResult> {
+  const env = options.env ?? process.env;
+  const cfgPath = resolveConfigPath(options.configPath, env);
+
+  const raw = await readJsonIfExists(cfgPath);
+  const fileCfg: Record<string, any> = isObject(raw) ? { ...raw } : {};
+
+  const existingProfiles = isObject(fileCfg.profiles)
+    ? { ...(fileCfg.profiles as Record<string, any>) }
+    : {};
+
+  const explicitProfile = (options.profile || '').trim();
+  const profileName = explicitProfile || (typeof fileCfg.profile === 'string' && fileCfg.profile.trim()) || 'default';
+
+  const currentProfile = isObject(existingProfiles[profileName])
+    ? { ...(existingProfiles[profileName] as Record<string, any>) }
+    : {};
+
+  const nextProfile: Record<string, any> = { ...currentProfile };
+  if (Object.prototype.hasOwnProperty.call(options, 'apiBaseUrl')) {
+    nextProfile.apiBaseUrl = options.apiBaseUrl;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'token')) {
+    nextProfile.token = options.token;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'cookie')) {
+    nextProfile.cookie = options.cookie;
+  }
+
+  const nextConfig: Record<string, any> = {
+    ...fileCfg,
+    profile: profileName,
+    profiles: {
+      ...existingProfiles,
+      [profileName]: nextProfile,
+    },
+  };
+
+  await writeJsonAtomic(cfgPath, nextConfig);
+
+  return {
+    path: cfgPath,
+    profile: profileName,
+    config: nextConfig,
+    profileConfig: nextProfile,
+  };
 }

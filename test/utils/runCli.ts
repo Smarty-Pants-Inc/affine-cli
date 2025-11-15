@@ -40,7 +40,10 @@ export async function runCli(args: string[], opts: RunCliOptions): Promise<strin
   return new Promise<string[]>((resolve, reject) => {
     const child = spawn(process.execPath, fullArgs, {
       cwd: path.resolve(__dirname, '../..'),
-      env: { ...process.env, ...(opts.env ?? {}) },
+      // When opts.env is provided, treat it as the full environment for the
+      // child process instead of a partial overlay. This lets tests construct
+      // truly "unauthenticated" shells by omitting AFFINE_TOKEN/COOKIE.
+      env: opts.env ?? process.env,
     });
 
     let stdout = '';
@@ -64,7 +67,10 @@ export async function runCli(args: string[], opts: RunCliOptions): Promise<strin
     child.on('close', (code) => {
       const trimmedStdout = stdout.trimEnd();
       const trimmedStderr = stderr.trimEnd();
-      const lines = trimmedStdout.length ? trimmedStdout.split(/\r?\n/) : [];
+      // Treat the full stdout as a single logical payload. This makes it safe
+      // to JSON.parse(logs[0]) even when the CLI pretty-prints JSON across
+      // multiple lines.
+      const lines = trimmedStdout.length ? [trimmedStdout] : [];
 
       if (code && code !== 0 && !opts.allowNonZeroExit) {
         const message = trimmedStderr || trimmedStdout || `CLI exited with code ${code}`;

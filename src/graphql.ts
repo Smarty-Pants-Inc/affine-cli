@@ -4,6 +4,7 @@
  */
 
 import { postJson, type HttpOptions } from './http';
+import { readDocument } from './mcp';
 
 export interface GqlErrorLocation {
   line: number;
@@ -31,9 +32,14 @@ export async function gql<T = any>(
   try {
     res = await postJson<GqlEnvelope<T>>('/graphql', { query, variables }, opts);
   } catch (err: any) {
-    const body: Buffer | undefined = err?.response?.body ?? err?.response?.body;
+    const rawBody = err?.response?.body;
+    const body: Buffer | undefined = Buffer.isBuffer(rawBody)
+      ? rawBody
+      : typeof rawBody === 'string'
+        ? Buffer.from(rawBody, 'utf8')
+        : undefined;
     // Try to parse GraphQL-style errors from a 4xx body to improve diagnostics
-    if (body && Buffer.isBuffer(body)) {
+    if (body) {
       try {
         const parsed = JSON.parse(body.toString('utf8')) as GqlEnvelope<unknown>;
         if (parsed?.errors && parsed.errors.length) {
@@ -202,7 +208,24 @@ export async function getDoc(
     { workspaceId, docId },
     opts,
   );
-  return data.workspace.doc ?? null;
+  const doc = data.workspace.doc ?? null;
+  if (!doc) return null;
+
+  // Cross-check against MCP read_document so that docs deleted from the
+  // realtime Yjs layer are treated as missing even if legacy metadata still
+  // exists in GraphQL.
+  try {
+    const { markdown } = await readDocument(workspaceId, docId, opts);
+    const text = String(markdown || '').toLowerCase();
+    if (text.includes('doc with id') && text.includes('not found')) {
+      return null;
+    }
+  } catch {
+    // If MCP is unavailable or fails for other reasons, fall back to the
+    // GraphQL metadata view and let callers handle any subsequent errors.
+  }
+
+  return doc;
 }
 
 // Search

@@ -73,44 +73,6 @@ export async function buildInitialPageUpdate(title?: string, content?: string): 
   return Y.encodeStateAsUpdate(spaceDoc);
 }
 
-// Build an incremental update that appends a new paragraph under a note on a fresh scaffold
-async function buildAppendParagraphUpdate(text: string): Promise<Uint8Array> {
-  const Y = await getY();
-  const spaceDoc = new Y.Doc();
-  const yBlocks = spaceDoc.getMap('blocks');
-
-  const pageId = randId(20);
-  const noteId = randId(20);
-  const paraId = randId(20);
-
-  const yPage: any = new Y.Map();
-  yPage.set('sys:id', pageId);
-  yPage.set('sys:flavour', 'affine:page');
-  yPage.set('sys:version', 2);
-  yPage.set('sys:children', Y.Array.from([noteId]));
-  yBlocks.set(pageId, yPage);
-
-  const yNote: any = new Y.Map();
-  yNote.set('sys:id', noteId);
-  yNote.set('sys:flavour', 'affine:note');
-  yNote.set('sys:version', 1);
-  yNote.set('sys:children', Y.Array.from([paraId]));
-  yNote.set('prop:xywh', '[0,0,600,400]');
-  yBlocks.set(noteId, yNote);
-
-  const yPara: any = new Y.Map();
-  yPara.set('sys:id', paraId);
-  yPara.set('sys:flavour', 'affine:paragraph');
-  yPara.set('sys:version', 1);
-  yPara.set('sys:children', Y.Array.from([]));
-  yPara.set('prop:type', 'text');
-  yPara.set('prop:collapsed', false);
-  yPara.set('prop:text', new Y.Text(String(text ?? '')));
-  yBlocks.set(paraId, yPara);
-
-  return Y.encodeStateAsUpdate(spaceDoc);
-}
-
 /**
  * Default Socket.IO transport (dynamic import). Not used in tests.
  * If socket.io-client is missing at runtime, throws a clear error.
@@ -205,6 +167,30 @@ async function joinWorkspace(transport: RealtimeTransport, workspaceId: string, 
     spaceId: workspaceId,
     clientVersion,
   });
+}
+
+function extractRealtimeError(ack: any): string | undefined {
+  if (!ack || typeof ack !== 'object') return undefined;
+  const raw = (ack as any).error;
+  if (!raw) return undefined;
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object') {
+    if (typeof (raw as any).message === 'string') return (raw as any).message;
+    try {
+      return JSON.stringify(raw);
+    } catch {
+      return String(raw);
+    }
+  }
+  return String(raw);
+}
+
+function ensureAckOk(ack: any, op: string): void {
+  const msg = extractRealtimeError(ack);
+  if (!msg) return;
+  const err = new Error(`realtime ${op} failed: ${msg}`);
+  (err as any).ack = ack;
+  throw err;
 }
 
 async function appendDocMetaToWorkspaceRoot(
@@ -325,13 +311,14 @@ export async function createDoc(opts: CreateDocOptions): Promise<{ docId: string
 
       return Y.encodeStateAsUpdate(spaceDoc);
     })();
-    const res = await transport.emit<{ accepted: true; timestamp?: number }>('space:push-doc-update', {
+    const res = await transport.emit<{ accepted?: boolean; timestamp?: number; error?: any }>('space:push-doc-update', {
       spaceType: 'workspace',
       spaceId: workspaceId,
       docId,
       // Socket.IO supports binary; send Buffer to preserve bytes
       update: Buffer.from(update).toString('base64'),
     });
+    ensureAckOk(res, 'space:push-doc-update');
     await appendDocMetaToWorkspaceRoot(transport, workspaceId, docId, opts.title);
     return { docId, timestamp: (res as any)?.timestamp };
   } finally {
@@ -360,12 +347,26 @@ export async function appendText(opts: AppendTextOptions): Promise<{ accepted: b
     const doc = new Y.Doc();
     let havePulled = false;
     try {
-      const pulled = await withTimeout(transport.emit<any>('space:pull-doc-update', {
-        spaceType: 'workspace', spaceId: workspaceId, docId: opts.docId,
-      }) as Promise<any>);
-      const raw = (pulled as any)?.update ?? pulled;
-      const buf: Buffer = Buffer.isBuffer(raw) ? (raw as Buffer) : Buffer.from(String(raw ?? ''), 'base64');
-      if (buf && buf.length) { Y.applyUpdate(doc, new Uint8Array(buf)); havePulled = true; }
+      const pulled = await withTimeout(
+        transport.emit<any>('space:load-doc', {
+          spaceType: 'workspace',
+          spaceId: workspaceId,
+          docId: opts.docId,
+        }) as Promise<any>,
+      );
+      const snapBase64 =
+        typeof (pulled as any)?.missing === 'string'
+          ? (pulled as any).missing
+          : typeof (pulled as any)?.state === 'string'
+            ? (pulled as any).state
+            : undefined;
+      if (snapBase64) {
+        const buf = Buffer.from(snapBase64, 'base64');
+        if (buf.length) {
+          Y.applyUpdate(doc, new Uint8Array(buf));
+          havePulled = true;
+        }
+      }
     } catch {
       // Fallback: rely on deterministic ids from create
       havePulled = false;
@@ -413,16 +414,43 @@ export async function appendText(opts: AppendTextOptions): Promise<{ accepted: b
     });
 
     const update = Y.encodeStateAsUpdate(doc);
-    const res = await transport.emit<{ accepted: true; timestamp?: number }>('space:push-doc-update', {
+    const res = await transport.emit<{ accepted?: boolean; timestamp?: number; error?: any }>('space:push-doc-update', {
       spaceType: 'workspace',
       spaceId: workspaceId,
       docId: opts.docId,
       update: Buffer.from(update).toString('base64'),
     });
-    return { accepted: true, timestamp: (res as any)?.timestamp };
+    ensureAckOk(res, 'space:push-doc-update');
+    const accepted = (res as any)?.accepted !== false;
+    return { accepted, timestamp: (res as any)?.timestamp };
   } finally {
     if (needClose) await transport.close();
   }
 }
 
-export default { createDoc, appendText, SocketIoTransport };
+export type DeleteDocRealtimeOptions = RealtimeOptions & {
+  docId: string;
+};
+
+export async function deleteDocRealtime(
+  opts: DeleteDocRealtimeOptions,
+): Promise<{ ok: boolean }>{
+  const workspaceId = opts.workspaceId;
+  const transport = await ensureTransport(opts);
+  const clientVersion = opts.clientVersion ?? '1.0.0';
+  let needClose = !opts.transport;
+  try {
+    await joinWorkspace(transport, workspaceId, clientVersion);
+    const ack = await transport.emit('space:delete-doc', {
+      spaceType: 'workspace',
+      spaceId: workspaceId,
+      docId: opts.docId,
+    });
+    ensureAckOk(ack, 'space:delete-doc');
+    return { ok: true };
+  } finally {
+    if (needClose) await transport.close();
+  }
+}
+
+export default { createDoc, appendText, deleteDocRealtime, SocketIoTransport };
